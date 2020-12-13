@@ -25,6 +25,7 @@ from .lru_cache_dataset import LRUCacheDataset
 from .mask_tokens_dataset import MaskTokensDataset
 from .monolingual_dataset import MonolingualDataset
 from .multi_corpus_sampled_dataset import MultiCorpusSampledDataset
+from .multi_source_translation_dataset import MultiSourceTranslationDataset
 from .nested_dictionary_dataset import NestedDictionaryDataset
 from .noising import NoisingDataset
 from .numel_dataset import NumelDataset

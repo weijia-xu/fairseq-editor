@@ -16,8 +16,9 @@ import os
 
 import torch
 
-from fairseq import checkpoint_utils, options, tasks, utils
+from fairseq import bleu, checkpoint_utils, options, tasks, utils
 from fairseq.data import encoders
+from fairseq.logging.meters import StopwatchMeter
 
 
 logging.basicConfig(
@@ -29,7 +30,7 @@ logging.basicConfig(
 logger = logging.getLogger('fairseq_cli.interactive')
 
 
-Batch = namedtuple('Batch', 'ids src_tokens src_lengths')
+Batch = namedtuple('Batch', 'ids src_tokens src_lengths tgt_tokens')
 Translation = namedtuple('Translation', 'src_str hypos pos_scores alignments')
 
 
@@ -46,16 +47,58 @@ def buffered_read(input, buffer_size):
         yield buffer
 
 
-def make_batches(lines, args, task, max_positions, encode_fn):
-    tokens = [
-        task.source_dictionary.encode_line(
-            encode_fn(src_str), add_if_not_exist=False
-        ).long()
-        for src_str in lines
-    ]
-    lengths = [t.numel() for t in tokens]
+def make_batches(lines, args, task, max_positions, encode_fn, separator=' <sep> '):
+    if args.constrained_decoding:
+        num_source_inputs = 3
+        src_tokens = [
+            task.source_dictionary.encode_line(
+                encode_fn(src_str.split(separator)[0]), add_if_not_exist=False
+            ).long()
+            for src_str in lines
+        ]
+        tokens = [src_tokens]
+        lengths = [torch.LongTensor([t.numel() for t in src_tokens])]
+        # read constraints
+        constraint_tokens = [
+            task.target_dictionary.encode_line(
+                encode_fn(' '.join(src_str.split(separator)[1].split(','))), append_eos=False, add_if_not_exist=False
+            ).long()
+            for src_str in lines
+        ]
+        constraint_marks = [torch.ones_like(const) for const in constraint_tokens]
+        for i, src_str in enumerate(lines):
+            idx = 0
+            constraint_str = src_str.split(separator)[1]
+            for phrase in constraint_str.split(','):
+                num_tokens = len(phrase.split())
+                constraint_marks[i][idx + num_tokens - 1] = 2
+                idx += num_tokens
+        tokens += [constraint_tokens, constraint_marks]
+        lengths += [torch.LongTensor([t.numel() for t in constraint_tokens]),
+                    torch.LongTensor([t.numel() for t in constraint_marks])]
+    else:
+        num_source_inputs = 1
+        tokens = [
+            task.source_dictionary.encode_line(
+                encode_fn(src_str.split(separator)[0]), add_if_not_exist=False
+            ).long()
+            for src_str in lines
+        ]
+        lengths = [t.numel() for t in tokens]
+
+    target_tokens = None
+    target_lengths = None
+    if args.has_target:
+        target_tokens = [
+            task.target_dictionary.encode_line(
+                encode_fn(src_str.split(separator)[-1]), add_if_not_exist=False
+            ).long()
+            for src_str in lines
+        ]
+        target_lengths = [t.numel() for t in target_tokens]
+
     itr = task.get_batch_iterator(
-        dataset=task.build_dataset_for_inference(tokens, lengths),
+        dataset=task.build_dataset_for_inference(tokens, lengths, target_tokens, target_lengths, num_source_inputs),
         max_tokens=args.max_tokens,
         max_sentences=args.max_sentences,
         max_positions=max_positions,
@@ -64,7 +107,9 @@ def make_batches(lines, args, task, max_positions, encode_fn):
     for batch in itr:
         yield Batch(
             ids=batch['id'],
-            src_tokens=batch['net_input']['src_tokens'], src_lengths=batch['net_input']['src_lengths'],
+            src_tokens=batch['net_input']['src_tokens'],
+            src_lengths=batch['net_input']['src_lengths'],
+            tgt_tokens=batch['target'],
         )
 
 
@@ -112,6 +157,7 @@ def main(args):
             model.cuda()
 
     # Initialize generator
+    gen_timer = StopwatchMeter()
     generator = task.build_generator(args)
 
     # Handle tokenization and BPE
@@ -132,6 +178,12 @@ def main(args):
             x = tokenizer.decode(x)
         return x
 
+    # Generate and compute BLEU score
+    if args.sacrebleu:
+        scorer = bleu.SacrebleuScorer()
+    else:
+        scorer = bleu.Scorer(tgt_dict.pad(), tgt_dict.eos(), tgt_dict.unk())
+
     # Load alignment dictionary for unknown word replacement
     # (None if no unknown word replacement, empty if no path to align dictionary)
     align_dict = utils.load_align_dict(args.replace_unk)
@@ -141,6 +193,7 @@ def main(args):
         *[model.max_positions() for model in models]
     )
 
+    num_sentences = 0
     if args.buffer_size > 1:
         logger.info('Sentence buffer size: %s', args.buffer_size)
     logger.info('NOTE: hypothesis and token scores are output in base 2')
@@ -151,29 +204,48 @@ def main(args):
         for batch in make_batches(inputs, args, task, max_positions, encode_fn):
             src_tokens = batch.src_tokens
             src_lengths = batch.src_lengths
+            tgt_tokens = batch.tgt_tokens
+            num_sentences += src_tokens[0].size(0)
             if use_cuda:
-                src_tokens = src_tokens.cuda()
-                src_lengths = src_lengths.cuda()
+                if isinstance(src_tokens, list):
+                    src_tokens = [tokens.cuda() for tokens in src_tokens]
+                    src_lengths = [lengths.cuda() for lengths in src_lengths]
+                else:
+                    src_tokens = src_tokens.cuda()
+                    src_lengths = src_lengths.cuda()
 
             sample = {
                 'net_input': {
                     'src_tokens': src_tokens,
                     'src_lengths': src_lengths,
                 },
+                'target': tgt_tokens,
             }
+
+            gen_timer.start()
             translations = task.inference_step(generator, models, sample)
+            num_generated_tokens = sum(len(h[0]['tokens']) for h in translations)
+            gen_timer.stop(num_generated_tokens)
+
             for i, (id, hypos) in enumerate(zip(batch.ids.tolist(), translations)):
                 src_tokens_i = utils.strip_pad(src_tokens[i], tgt_dict.pad())
-                results.append((start_id + id, src_tokens_i, hypos))
+                tgt_tokens_i = None
+                if tgt_tokens is not None:
+                    tgt_tokens_i = utils.strip_pad(tgt_tokens[i, :], tgt_dict.pad()).int().cpu()
+                results.append((start_id + id, src_tokens_i, hypos, tgt_tokens_i))
 
         # sort output to match input order
-        for id, src_tokens, hypos in sorted(results, key=lambda x: x[0]):
+        for id, src_tokens, hypos, tgt_tokens in sorted(results, key=lambda x: x[0]):
             if src_dict is not None:
                 src_str = src_dict.string(src_tokens, args.remove_bpe)
                 print('S-{}\t{}'.format(id, src_str))
 
+            if tgt_tokens is not None:
+                tgt_str = tgt_dict.string(tgt_tokens, args.remove_bpe, escape_unk=True)
+                print('T-{}\t{}'.format(id, tgt_str))
+
             # Process top predictions
-            for hypo in hypos[:min(len(hypos), args.nbest)]:
+            for j, hypo in enumerate(hypos[:min(len(hypos), args.nbest)]):
                 hypo_tokens, hypo_str, alignment = utils.post_process_prediction(
                     hypo_tokens=hypo['tokens'].int().cpu(),
                     src_str=src_str,
@@ -199,9 +271,39 @@ def main(args):
                         id,
                         alignment_str
                     ))
+                if args.print_step:
+                    print('I-{}\t{}'.format(id, hypo['steps']))
+                    print('O-{}\t{}'.format(id, hypo['num_ops']))
+
+                if getattr(args, 'retain_iter_history', False):
+                    for step, h in enumerate(hypo['history']):
+                        _, h_str, _ = utils.post_process_prediction(
+                            hypo_tokens=h['tokens'].int().cpu(),
+                            src_str=src_str,
+                            alignment=None,
+                            align_dict=None,
+                            tgt_dict=tgt_dict,
+                            remove_bpe=None,
+                        )
+                        print('E-{}_{}\t{}'.format(id, step, h_str))
+
+                # Score only the top hypothesis
+                if tgt_tokens is not None and j == 0:
+                    if align_dict is not None or args.remove_bpe is not None:
+                        # Convert back to tokens for evaluation with unk replacement and/or without BPE
+                        tgt_tokens = tgt_dict.encode_line(tgt_str, add_if_not_exist=True)
+                    if hasattr(scorer, 'add_string'):
+                        scorer.add_string(tgt_str, hypo_str)
+                    else:
+                        scorer.add(tgt_tokens, hypo_tokens)
 
         # update running id counter
         start_id += len(inputs)
+
+    logger.info('Translated {} sentences ({} tokens) in {:.1f}s ({:.2f} sentences/s, {:.2f} tokens/s)'.format(
+        num_sentences, gen_timer.n, gen_timer.sum, num_sentences / gen_timer.sum, 1. / gen_timer.avg))
+    if args.has_target:
+        logger.info('Generate with beam={}: {}'.format(args.beam, scorer.result_string()))
 
 
 def cli_main():

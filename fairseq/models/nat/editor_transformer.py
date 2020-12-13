@@ -3,6 +3,7 @@
 # This source code is licensed under the MIT license found in the
 # LICENSE file in the root directory of this source tree.
 
+import random
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -25,13 +26,13 @@ from fairseq.modules.transformer_sentence_encoder import init_bert_params
 
 from .levenshtein_utils import (
     _skip, _skip_encoder_out, _fill,
-    _get_ins_targets, _get_del_targets,
-    _apply_ins_masks, _apply_ins_words, _apply_del_words
+    _get_advanced_ins_targets, _get_advanced_reposition_targets,
+    _apply_ins_masks, _apply_ins_words, _apply_reposition_words,
 )
 
 
-@register_model("levenshtein_transformer")
-class LevenshteinTransformerModel(FairseqNATModel):
+@register_model("editor_transformer")
+class EDITORTransformerModel(FairseqNATModel):
 
     @property
     def allow_length_beam(self):
@@ -69,7 +70,7 @@ class LevenshteinTransformerModel(FairseqNATModel):
 
     @classmethod
     def build_decoder(cls, args, tgt_dict, embed_tokens):
-        decoder = LevenshteinTransformerDecoder(args, tgt_dict, embed_tokens)
+        decoder = EDITORTransformerDecoder(args, tgt_dict, embed_tokens)
         if getattr(args, "apply_bert_init", False):
             decoder.apply(init_bert_params)
         return decoder
@@ -83,57 +84,100 @@ class LevenshteinTransformerModel(FairseqNATModel):
         # encoding
         encoder_out = self.encoder(src_tokens, src_lengths=src_lengths, **kwargs)
 
-        # generate training labels for insertion
-        masked_tgt_masks, masked_tgt_tokens, mask_ins_targets = _get_ins_targets(
-            prev_output_tokens, tgt_tokens, self.pad, self.unk
-        )
-        mask_ins_targets = mask_ins_targets.clamp(min=0, max=255)  # for safe prediction
-        mask_ins_masks = prev_output_tokens[:, 1:].ne(self.pad)
+        if random.random() < 0.5:  # insertion -> reposition & deletion
+            # generate training labels for insertion
+            masked_tgt_masks, masked_tgt_tokens, mask_ins_targets = _get_advanced_ins_targets(
+                prev_output_tokens, tgt_tokens, self.pad, self.unk
+            )
+            mask_ins_targets = mask_ins_targets.clamp(min=0, max=255)  # for safe prediction
+            mask_ins_masks = prev_output_tokens[:, 1:].ne(self.pad)
 
-        mask_ins_out, _ = self.decoder.forward_mask_ins(
-            normalize=False,
-            prev_output_tokens=prev_output_tokens,
-            encoder_out=encoder_out
-        )
-        word_ins_out, _ = self.decoder.forward_word_ins(
-            normalize=False,
-            prev_output_tokens=masked_tgt_tokens,
-            encoder_out=encoder_out
-        )
+            mask_ins_out, _ = self.decoder.forward_mask_ins(
+                normalize=False,
+                prev_output_tokens=prev_output_tokens,
+                encoder_out=encoder_out
+            )
+            word_ins_out, _ = self.decoder.forward_word_ins(
+                normalize=False,
+                prev_output_tokens=masked_tgt_tokens,
+                encoder_out=encoder_out
+            )
 
-        # make online prediction
-        if self.decoder.sampling_for_deletion:
-            word_predictions = torch.multinomial(
-                F.softmax(word_ins_out, -1).view(-1, word_ins_out.size(-1)), 1).view(
-                    word_ins_out.size(0), -1)
-        else:
-            word_predictions = F.log_softmax(word_ins_out, dim=-1).max(2)[1]
+            # make online prediction
+            if self.decoder.sampling_for_deletion:
+                word_predictions = torch.multinomial(
+                    F.softmax(word_ins_out, -1).view(-1, word_ins_out.size(-1)), 1).view(
+                        word_ins_out.size(0), -1)
+            else:
+                word_predictions = F.log_softmax(word_ins_out, dim=-1).max(-1)[1]
 
-        word_predictions.masked_scatter_(
-            ~masked_tgt_masks, tgt_tokens[~masked_tgt_masks]
-        )
+            word_predictions.masked_scatter_(
+                ~masked_tgt_masks, tgt_tokens[~masked_tgt_masks]
+            )
 
-        # generate training labels for deletion
-        word_del_targets = _get_del_targets(word_predictions, tgt_tokens, self.pad)
-        word_del_out, _ = self.decoder.forward_word_del(
-            normalize=False,
-            prev_output_tokens=word_predictions,
-            encoder_out=encoder_out)
-        word_del_masks = word_predictions.ne(self.pad)
+            # generate training labels for reposition
+            word_reposition_targets = _get_advanced_reposition_targets(word_predictions, tgt_tokens, self.pad)
+            word_reposition_out, _ = self.decoder.forward_word_reposition(
+                normalize=False,
+                prev_output_tokens=word_predictions,
+                encoder_out=encoder_out)
+            word_reposition_masks = word_predictions.ne(self.pad)
+        else:  # reposition & deletion -> insertion
+            # generate training labels for deletion and substitution
+            word_reposition_targets = _get_advanced_reposition_targets(
+                prev_output_tokens, tgt_tokens, self.pad
+            )
+            word_reposition_out, _ = self.decoder.forward_word_reposition(
+                normalize=False,
+                prev_output_tokens=prev_output_tokens,
+                encoder_out=encoder_out)
+            word_reposition_masks = prev_output_tokens.ne(self.pad)
+
+            # make online prediction
+            word_predictions = F.log_softmax(word_reposition_out, dim=-1).max(-1)[1]
+
+            word_predictions, _, _, _ = _apply_reposition_words(
+                prev_output_tokens,
+                None,
+                None,
+                None,
+                word_predictions,
+                self.pad,
+                self.bos,
+                self.eos,
+            )
+
+            # generate training labels for insertion
+            masked_tgt_masks, masked_tgt_tokens, mask_ins_targets = _get_advanced_ins_targets(
+                word_predictions, tgt_tokens, self.pad, self.unk
+            )
+            mask_ins_targets = mask_ins_targets.clamp(min=0, max=255)  # for safe prediction
+            mask_ins_masks = word_predictions[:, 1:].ne(self.pad)
+
+            mask_ins_out, _ = self.decoder.forward_mask_ins(
+                normalize=False,
+                prev_output_tokens=word_predictions,
+                encoder_out=encoder_out
+            )
+            word_ins_out, _ = self.decoder.forward_word_ins(
+                normalize=False,
+                prev_output_tokens=masked_tgt_tokens,
+                encoder_out=encoder_out
+            )
 
         return {
             "mask_ins": {
                 "out": mask_ins_out, "tgt": mask_ins_targets,
                 "mask": mask_ins_masks, "ls": 0.01,
             },
-            "word_ins": {
+            "word_ins_ml": {
                 "out": word_ins_out, "tgt": tgt_tokens,
                 "mask": masked_tgt_masks, "ls": self.args.label_smoothing,
-                "nll_loss": True
+                "nll_loss": True, "factor": 1.0,
             },
-            "word_del": {
-                "out": word_del_out, "tgt": word_del_targets,
-                "mask": word_del_masks
+            "word_reposition": {
+                "out": word_reposition_out, "tgt": word_reposition_targets,
+                "mask": word_reposition_masks,
             }
         }
 
@@ -145,7 +189,7 @@ class LevenshteinTransformerModel(FairseqNATModel):
         output_marks = decoder_out.output_marks
         output_scores = decoder_out.output_scores
         attn = decoder_out.attn
-        total_deletion_ops, total_insertion_ops = decoder_out.num_ops
+        total_reposition_ops, total_deletion_ops, total_insertion_ops = decoder_out.num_ops
         history = decoder_out.history
 
         bsz = output_tokens.size(0)
@@ -159,38 +203,44 @@ class LevenshteinTransformerModel(FairseqNATModel):
                 src_lens = (~encoder_out.encoder_padding_mask).sum(1)
             max_lens = (src_lens * max_ratio).clamp(min=10).long()
 
-        # delete words
-        # do not delete tokens if it is <s> </s>
-        can_del_word = output_tokens.ne(self.pad).sum(1) > 2
-        if can_del_word.sum() != 0:  # we cannot delete, skip
-            word_del_score, word_del_attn = self.decoder.forward_word_del(
+        # reposition words
+        # do not apply if it is <s> </s>
+        can_reposition_word = output_tokens.ne(self.pad).sum(1) > 2
+        if can_reposition_word.sum() != 0:
+            word_reposition_score, word_reposition_attn = self.decoder.forward_word_reposition(
                 normalize=True,
-                prev_output_tokens=_skip(output_tokens, can_del_word),
-                encoder_out=_skip_encoder_out(self.encoder, encoder_out, can_del_word)
+                prev_output_tokens=_skip(output_tokens, can_reposition_word),
+                encoder_out=_skip_encoder_out(self.encoder, encoder_out, can_reposition_word)
             )
-            word_del_score[:, :, 1] = word_del_score[:, :, 1] + del_reward
-            word_del_pred = word_del_score.max(-1)[1].bool()
 
             if hard_constrained_decoding:
-                no_del_mask = output_marks[can_del_word].ne(0)
-                word_del_pred.masked_fill_(no_del_mask, False)
+                no_del_mask = output_marks[can_reposition_word].ne(0)
+                word_del_score = word_reposition_score[:, :, 0]
+                word_del_score.masked_fill_(no_del_mask, -float('Inf'))
+                word_reposition_score = torch.cat([word_del_score.unsqueeze(2), word_reposition_score[:, :, 1:]], 2)
 
-            total_deletion_ops += word_del_pred.sum().item()
+            word_reposition_score[:, :, 0] = word_reposition_score[:, :, 0] + del_reward
+            word_reposition_pred = word_reposition_score.max(-1)[1]
+            num_deletion = word_reposition_pred.eq(0).sum().item() - word_reposition_pred.size(0)
+            total_deletion_ops += num_deletion
+            total_reposition_ops += word_reposition_pred.ne(
+                torch.arange(word_reposition_pred.size(1), device=word_reposition_pred.device)
+                .unsqueeze(0)).sum().item() - num_deletion
 
-            _tokens, _marks, _scores, _attn = _apply_del_words(
-                output_tokens[can_del_word],
-                output_marks[can_del_word],
-                output_scores[can_del_word],
-                word_del_attn,
-                word_del_pred,
+            _tokens, _marks, _scores, _attn = _apply_reposition_words(
+                output_tokens[can_reposition_word],
+                output_marks[can_reposition_word],
+                output_scores[can_reposition_word],
+                word_reposition_attn,
+                word_reposition_pred,
                 self.pad,
                 self.bos,
                 self.eos,
             )
-            output_tokens = _fill(output_tokens, can_del_word, _tokens, self.pad)
-            output_marks = _fill(output_marks, can_del_word, _marks, 0)
-            output_scores = _fill(output_scores, can_del_word, _scores, 0)
-            attn = _fill(attn, can_del_word, _attn, 0.)
+            output_tokens = _fill(output_tokens, can_reposition_word, _tokens, self.pad)
+            output_marks = _fill(output_marks, can_reposition_word, _marks, 0)
+            output_scores = _fill(output_scores, can_reposition_word, _scores, 0)
+            attn = _fill(attn, can_reposition_word, _attn, 0.)
 
             if history is not None:
                 history.append(output_tokens.clone())
@@ -225,6 +275,7 @@ class LevenshteinTransformerModel(FairseqNATModel):
                 self.unk,
                 self.eos,
             )
+
             output_tokens = _fill(output_tokens, can_ins_mask, _tokens, self.pad)
             output_marks = _fill(output_marks, can_ins_mask, _marks, 0)
             output_scores = _fill(output_scores, can_ins_mask, _scores, 0)
@@ -268,7 +319,7 @@ class LevenshteinTransformerModel(FairseqNATModel):
             output_marks=output_marks,
             output_scores=output_scores,
             attn=attn,
-            num_ops=(total_deletion_ops, total_insertion_ops),
+            num_ops=(total_reposition_ops, total_deletion_ops, total_insertion_ops),
             history=history
         )
 
@@ -305,12 +356,12 @@ class LevenshteinTransformerModel(FairseqNATModel):
             attn=None,
             step=0,
             max_step=0,
-            num_ops=(0, 0),
+            num_ops=(0, 0, 0),
             history=None
         )
 
 
-class LevenshteinTransformerDecoder(FairseqNATDecoder):
+class EDITORTransformerDecoder(FairseqNATDecoder):
     def __init__(self, args, dictionary, embed_tokens, no_encoder_attn=False):
         super().__init__(
             args, dictionary, embed_tokens, no_encoder_attn=no_encoder_attn
@@ -321,7 +372,6 @@ class LevenshteinTransformerDecoder(FairseqNATDecoder):
         self.eos = dictionary.eos()
         self.sampling_for_deletion = getattr(args, "sampling_for_deletion", False)
         self.embed_mask_ins = Embedding(256, self.output_embed_dim * 2, None)
-        self.embed_word_del = Embedding(2, self.output_embed_dim, None)
 
         # del_word, ins_mask, ins_word
         self.early_exit = [int(i) for i in args.early_exit.split(',')]
@@ -334,16 +384,16 @@ class LevenshteinTransformerDecoder(FairseqNATDecoder):
                                 TransformerDecoderLayer(args, no_encoder_attn)
                                 for _ in range(self.early_exit[1])
                             ])
-        self.layers_del = None
+        self.layers_reposition = None
         if getattr(args, "no_share_discriminator", False):
-            self.layers_del = nn.ModuleList([
+            self.layers_reposition = nn.ModuleList([
                                 TransformerDecoderLayer(args, no_encoder_attn)
                                 for _ in range(self.early_exit[0])
                             ])
 
         if getattr(args, "share_discriminator_maskpredictor", False):
             assert getattr(args, "no_share_discriminator", False), "must set saperate discriminator"
-            self.layers_msk = self.layers_del
+            self.layers_msk = self.layers_reposition
 
     def extract_features(
         self, prev_output_tokens, encoder_out=None, early_exit=None, layers=None, **unused
@@ -353,11 +403,12 @@ class LevenshteinTransformerDecoder(FairseqNATDecoder):
         Inputs:
             prev_output_tokens: Tensor(B, T)
             encoder_out: a dictionary of hidden states and masks
+
         Returns:
             tuple:
                 - the decoder's features of shape `(batch, tgt_len, embed_dim)`
                 - a dictionary with any model-specific outputs
-            the LevenshteinTransformer decoder has full-attention to all generated tokens
+            the EDITORTransformer decoder has full-attention to all generated tokens
         """
         # embed positions
         positions = (
@@ -427,18 +478,20 @@ class LevenshteinTransformerDecoder(FairseqNATDecoder):
         return decoder_out, extra['attn']
 
     @ensemble_decoder
-    def forward_word_del(self, normalize, encoder_out, prev_output_tokens, **unused):
+    def forward_word_reposition(self, normalize, encoder_out, prev_output_tokens, **unused):
         features, extra = self.extract_features(
-            prev_output_tokens, encoder_out=encoder_out, early_exit=self.early_exit[0], layers=self.layers_del, **unused
+            prev_output_tokens, encoder_out=encoder_out, early_exit=self.early_exit[2], layers=self.layers_reposition, **unused
         )
-        decoder_out = F.linear(features, self.embed_word_del.weight)
+        prev_output_embed = self.embed_tokens(prev_output_tokens)
+        # B x T x T
+        decoder_out = torch.bmm(features, prev_output_embed.transpose(1, 2))
         if normalize:
             return F.log_softmax(decoder_out, -1), extra['attn']
         return decoder_out, extra['attn']
 
 
-@register_model_architecture("levenshtein_transformer", "levenshtein_transformer")
-def levenshtein_base_architecture(args):
+@register_model_architecture("editor_transformer", "editor_transformer")
+def editor_base_architecture(args):
     args.encoder_embed_path = getattr(args, "encoder_embed_path", None)
     args.encoder_embed_dim = getattr(args, "encoder_embed_dim", 512)
     args.encoder_ffn_embed_dim = getattr(args, "encoder_ffn_embed_dim", 2048)
@@ -474,7 +527,6 @@ def levenshtein_base_architecture(args):
     args.decoder_output_dim = getattr(
         args, "decoder_output_dim", args.decoder_embed_dim
     )
-    args.sampling_for_deletion = getattr(args, "sampling_for_deletion", False)
     args.decoder_input_dim = getattr(args, "decoder_input_dim", args.decoder_embed_dim)
     args.early_exit = getattr(args, "early_exit", "6,6,6")
     args.no_share_discriminator = getattr(args, "no_share_discriminator", False)
@@ -484,17 +536,17 @@ def levenshtein_base_architecture(args):
 
 
 @register_model_architecture(
-    "levenshtein_transformer", "levenshtein_transformer_wmt_en_de"
+    "editor_transformer", "editor_transformer_wmt_en_de"
 )
-def levenshtein_transformer_wmt_en_de(args):
-    levenshtein_base_architecture(args)
+def editor_transformer_wmt_en_de(args):
+    editor_base_architecture(args)
 
 
 # similar parameters used in the "Attention Is All You Need" paper (Vaswani et al., 2017)
 @register_model_architecture(
-    "levenshtein_transformer", "levenshtein_transformer_vaswani_wmt_en_de_big"
+    "editor_transformer", "editor_transformer_vaswani_wmt_en_de_big"
 )
-def levenshtein_transformer_vaswani_wmt_en_de_big(args):
+def editor_transformer_vaswani_wmt_en_de_big(args):
     args.encoder_embed_dim = getattr(args, "encoder_embed_dim", 1024)
     args.encoder_ffn_embed_dim = getattr(args, "encoder_ffn_embed_dim", 4096)
     args.encoder_attention_heads = getattr(args, "encoder_attention_heads", 16)
@@ -503,16 +555,16 @@ def levenshtein_transformer_vaswani_wmt_en_de_big(args):
     args.decoder_ffn_embed_dim = getattr(args, "decoder_ffn_embed_dim", 4096)
     args.decoder_attention_heads = getattr(args, "decoder_attention_heads", 16)
     args.dropout = getattr(args, "dropout", 0.3)
-    levenshtein_base_architecture(args)
+    editor_base_architecture(args)
 
 
 # default parameters used in tensor2tensor implementation
 @register_model_architecture(
-    "levenshtein_transformer", "levenshtein_transformer_wmt_en_de_big"
+    "editor_transformer", "editor_transformer_wmt_en_de_big"
 )
-def levenshtein_transformer_wmt_en_de_big_t2t(args):
+def editor_transformer_wmt_en_de_big_t2t(args):
     args.encoder_normalize_before = getattr(args, "encoder_normalize_before", True)
     args.decoder_normalize_before = getattr(args, "decoder_normalize_before", True)
     args.attention_dropout = getattr(args, "attention_dropout", 0.1)
     args.activation_dropout = getattr(args, "activation_dropout", 0.1)
-    levenshtein_transformer_vaswani_wmt_en_de_big(args)
+    editor_transformer_vaswani_wmt_en_de_big(args)

@@ -35,6 +35,19 @@ torch::Tensor LevenshteinDistance(
     return LevenshteinDistanceCuda(source, target, source_length, target_length);
 }
 
+torch::Tensor AdvancedLevenshteinDistance(
+        torch::Tensor source,
+        torch::Tensor target,
+        torch::Tensor source_length,
+        torch::Tensor target_length) {
+
+    CHECK_INPUT(source);
+    CHECK_INPUT(target);
+    CHECK_INPUT(source_length);
+    CHECK_INPUT(target_length);
+    return AdvancedLevenshteinDistanceCuda(source, target, source_length, target_length);
+}
+
 torch::Tensor GenerateDeletionLabel(
         torch::Tensor source,
         torch::Tensor operations) {
@@ -53,8 +66,19 @@ std::pair<torch::Tensor, torch::Tensor> GenerateInsertionLabel(
     return GenerateInsertionLabelCuda(target, operations);
 }
 
+torch::Tensor GenerateRepositionLabel(
+        torch::Tensor source,
+        torch::Tensor operations) {
+
+    CHECK_INPUT(source);
+    CHECK_INPUT(operations);
+    return GenerateRepositionLabelCuda(source, operations);
+}
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    m.def("levenshtein_distance", &LevenshteinDistance, "Levenshtein distance");
+    m.def("levenshtein_distance", &LevenshteinDistance, "Levenshtein Distance");
+    m.def("advanced_levenshtein_distance", &AdvancedLevenshteinDistance, "Advanced Levenshtein Distance");
     m.def("generate_deletion_labels", &GenerateDeletionLabel, "Generate Deletion Label");
     m.def("generate_insertion_labels", &GenerateInsertionLabel, "Generate Insertion Label");
+    m.def("generate_reposition_labels", &GenerateRepositionLabel, "Generate Reposition Label");
 }

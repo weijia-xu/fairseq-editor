@@ -5,6 +5,7 @@
 
 from collections import namedtuple
 
+import random
 import torch
 import numpy as np
 
@@ -13,10 +14,12 @@ from fairseq import utils
 
 DecoderOut = namedtuple('IterativeRefinementDecoderOut', [
     'output_tokens',
+    'output_marks',
     'output_scores',
     'attn',
     'step',
     'max_step',
+    'num_ops',
     'history'
 ])
 
@@ -27,6 +30,7 @@ class IterativeRefinementGenerator(object):
         tgt_dict,
         models=None,
         eos_penalty=0.0,
+        del_reward=0.0,
         max_iter=10,
         max_ratio=2,
         beam_size=1,
@@ -35,6 +39,9 @@ class IterativeRefinementGenerator(object):
         adaptive=True,
         retain_history=False,
         reranking=False,
+        constrained_decoding=False,
+        hard_constrained_decoding=False,
+        random_seed=1,
     ):
         """
         Generates translations based on iterative refinement.
@@ -48,12 +55,14 @@ class IterativeRefinementGenerator(object):
             retain_dropout: retaining dropout in the inference
             adaptive: decoding with early stop
         """
+        self.tgt_dict = tgt_dict
         self.bos = tgt_dict.bos()
         self.pad = tgt_dict.pad()
         self.unk = tgt_dict.unk()
         self.eos = tgt_dict.eos()
         self.vocab_size = len(tgt_dict)
         self.eos_penalty = eos_penalty
+        self.del_reward = del_reward
         self.max_iter = max_iter
         self.max_ratio = max_ratio
         self.beam_size = beam_size
@@ -61,6 +70,9 @@ class IterativeRefinementGenerator(object):
         self.decoding_format = decoding_format
         self.retain_dropout = retain_dropout
         self.retain_history = retain_history
+        self.constrained_decoding = constrained_decoding
+        self.hard_constrained_decoding = hard_constrained_decoding
+        self.random_seed = random_seed
         self.adaptive = adaptive
         self.models = models
 
@@ -99,7 +111,10 @@ class IterativeRefinementGenerator(object):
                 timer.stop(sample["ntokens"])
             for i, id in enumerate(sample["id"]):
                 # remove padding
-                src = utils.strip_pad(sample["net_input"]["src_tokens"][i, :], self.pad)
+                if self.constrained_decoding:
+                    src = utils.strip_pad(sample["net_input"]["src_tokens"][0][i, :], self.pad)
+                else:
+                    src = utils.strip_pad(sample["net_input"]["src_tokens"][i, :], self.pad)
                 ref = utils.strip_pad(sample["target"][i, :], self.pad)
                 yield id, src, ref, hypos[i]
 
@@ -124,14 +139,24 @@ class IterativeRefinementGenerator(object):
             assert model.allow_ensemble, "{} does not support ensembling".format(model.__class__.__name__)
             model.enable_ensemble(models)
 
-        # TODO: better encoder inputs?
-        src_tokens = sample["net_input"]["src_tokens"]
-        src_lengths = sample["net_input"]["src_lengths"]
-        bsz, src_len = src_tokens.size()
+        if self.constrained_decoding:
+            # TODO: better encoder inputs?
+            src_tokens = sample["net_input"]["src_tokens"][0]
+            src_lengths = sample["net_input"]["src_lengths"][0]
+            bsz, src_len = src_tokens.size()
+            constraints = sample["net_input"]["src_tokens"][1]
+            constraint_marks = sample["net_input"]["src_tokens"][2]
+        else:
+            constraints = None
+            constraint_marks = None
+            # TODO: better encoder inputs?
+            src_tokens = sample["net_input"]["src_tokens"]
+            src_lengths = sample["net_input"]["src_lengths"]
+            bsz, src_len = src_tokens.size()
 
         # initialize
         encoder_out = model.forward_encoder([src_tokens, src_lengths])
-        prev_decoder_out = model.initialize_output_tokens(encoder_out, src_tokens)
+        prev_decoder_out = model.initialize_output_tokens(encoder_out, src_tokens, constraints, constraint_marks)
 
         if self.beam_size > 1:
             assert model.allow_length_beam, \
@@ -151,18 +176,19 @@ class IterativeRefinementGenerator(object):
 
         finalized = [[] for _ in range(bsz)]
 
-        def is_a_loop(x, y, s, a):
+        def is_a_loop(x, y, m, s, a):
             b, l_x, l_y = x.size(0), x.size(1), y.size(1)
             if l_x > l_y:
                 y = torch.cat([y, x.new_zeros(b, l_x - l_y).fill_(self.pad)], 1)
+                m = torch.cat([m, m.new_zeros(b, l_x - l_y)], 1)
                 s = torch.cat([s, s.new_zeros(b, l_x - l_y)], 1)
                 if a is not None:
                     a = torch.cat([a, a.new_zeros(b, l_x - l_y, a.size(2))], 1)
             elif l_x < l_y:
                 x = torch.cat([x, y.new_zeros(b, l_y - l_x).fill_(self.pad)], 1)
-            return (x == y).all(1), y, s, a
+            return (x == y).all(1), y, m, s, a
 
-        def finalized_hypos(step, prev_out_token, prev_out_score, prev_out_attn):
+        def finalized_hypos(step, num_ops, prev_out_token, prev_out_score, prev_out_attn):
             cutoff = prev_out_token.ne(self.pad)
             tokens = prev_out_token[cutoff]
             if prev_out_score is None:
@@ -178,6 +204,7 @@ class IterativeRefinementGenerator(object):
                 alignment = hypo_attn.max(dim=1)[1]
             return {
                 "steps": step,
+                "num_ops": num_ops,
                 "tokens": tokens,
                 "positional_scores": scores,
                 "score": score,
@@ -189,6 +216,7 @@ class IterativeRefinementGenerator(object):
 
             decoder_options = {
                 "eos_penalty": self.eos_penalty,
+                "del_reward": self.del_reward,
                 "max_ratio": self.max_ratio,
                 "decoding_format": self.decoding_format,
             }
@@ -198,16 +226,18 @@ class IterativeRefinementGenerator(object):
             )
 
             decoder_out = model.forward_decoder(
-                prev_decoder_out, encoder_out, **decoder_options
+                prev_decoder_out, encoder_out, self.hard_constrained_decoding, **decoder_options
             )
 
             if self.adaptive:
                 # terminate if there is a loop
-                terminated, out_tokens, out_scores, out_attn = is_a_loop(
-                    prev_output_tokens, decoder_out.output_tokens, decoder_out.output_scores, decoder_out.attn
+                terminated, out_tokens, out_marks, out_scores, out_attn = is_a_loop(
+                    prev_output_tokens, decoder_out.output_tokens, decoder_out.output_marks,
+                    decoder_out.output_scores, decoder_out.attn
                 )
                 decoder_out = decoder_out._replace(
                     output_tokens=out_tokens,
+                    output_marks=out_marks,
                     output_scores=out_scores,
                     attn=out_attn,
                 )
@@ -221,6 +251,7 @@ class IterativeRefinementGenerator(object):
             # collect finalized sentences
             finalized_idxs = sent_idxs[terminated]
             finalized_tokens = decoder_out.output_tokens[terminated]
+            finalized_marks = decoder_out.output_marks[terminated]
             finalized_scores = decoder_out.output_scores[terminated]
             finalized_attn = (
                 None if (decoder_out.attn is None or decoder_out.attn.size(0) == 0) else decoder_out.attn[terminated]
@@ -233,6 +264,7 @@ class IterativeRefinementGenerator(object):
                 finalized[finalized_idxs[i]] = [
                     finalized_hypos(
                         step,
+                        decoder_out.num_ops,
                         finalized_tokens[i],
                         finalized_scores[i],
                         None if finalized_attn is None else finalized_attn[i],
@@ -245,6 +277,7 @@ class IterativeRefinementGenerator(object):
                         finalized[finalized_idxs[i]][0]['history'].append(
                             finalized_hypos(
                                 step,
+                                decoder_out.num_ops,
                                 finalized_history_tokens[j][i],
                                 None, None
                             )
@@ -258,6 +291,7 @@ class IterativeRefinementGenerator(object):
             not_terminated = ~terminated
             prev_decoder_out = decoder_out._replace(
                 output_tokens=decoder_out.output_tokens[not_terminated],
+                output_marks=decoder_out.output_marks[not_terminated],
                 output_scores=decoder_out.output_scores[not_terminated],
                 attn=decoder_out.attn[not_terminated]
                 if (decoder_out.attn is not None and decoder_out.attn.size(0) > 0)

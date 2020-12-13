@@ -5,3 +5,4 @@ from .iterative_nonautoregressive_transformer import *
 from .cmlm_transformer import *
 from .levenshtein_transformer import *
 from .insertion_transformer import *
+from .editor_transformer import *

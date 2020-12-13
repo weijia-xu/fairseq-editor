@@ -174,6 +174,25 @@ def post_process_prediction(
     return hypo_tokens, hypo_str, alignment
 
 
+def apply_bpe(subword_list, tgt_words, bpe_symbol="@@"):
+    bpe_symbol = bpe_symbol.strip()
+
+    curr_word = ""
+    word_to_subwords = {}
+    for subword in subword_list:
+        if curr_word:
+            curr_word += " "
+        curr_word += subword
+        if not subword.endswith(bpe_symbol):
+            word_to_subwords[curr_word.replace(bpe_symbol + " ", "")] = curr_word.split()
+            curr_word = ""
+
+    new_subword_list = []
+    for word in tgt_words:
+        new_subword_list += word_to_subwords[word]
+    return new_subword_list
+
+
 def make_positions(tensor, padding_idx: int, onnx_trace: bool = False):
     """Replace non-padding symbols with their position numbers.
 

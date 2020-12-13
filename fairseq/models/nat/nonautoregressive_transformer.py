@@ -129,7 +129,7 @@ class NATransformerModel(FairseqNATModel):
             history=history
         )
 
-    def initialize_output_tokens(self, encoder_out, src_tokens):
+    def initialize_output_tokens(self, encoder_out, src_tokens, initial_tokens):
         # length prediction
         length_tgt = self.decoder.forward_length_prediction(
             self.decoder.forward_length(normalize=True, encoder_out=encoder_out),
@@ -147,6 +147,12 @@ class NATransformerModel(FairseqNATModel):
         )
         initial_output_tokens[:, 0] = self.bos
         initial_output_tokens.scatter_(1, length_tgt[:, None] - 1, self.eos)
+
+        if initial_tokens:
+            for i, seq in enumerate(initial_tokens):
+                for j, tok in enumerate(seq):
+                    if j + 1 < initial_output_tokens.size(1):
+                        initial_output_tokens[i, j + 1] = tok
 
         initial_output_scores = initial_output_tokens.new_zeros(
             *initial_output_tokens.size()

@@ -226,6 +226,6 @@ class EnsembleLevT(BasicEnsembleModel):
         attn = _fill(attn, can_ins_word, word_ins_attn, 0.)
         return output_tokens, output_scores, attn
 
-    def initialize_output_tokens(self, encoder_outs, src_tokens):
+    def initialize_output_tokens(self, encoder_outs, src_tokens, initial_tokens):
         # LevT doesn't do length prediction.
-        return self.models[0].initialize_output_tokens(encoder_outs[0], src_tokens)
+        return self.models[0].initialize_output_tokens(encoder_outs[0], src_tokens, initial_tokens)

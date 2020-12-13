@@ -551,7 +551,9 @@ def add_generation_args(parser):
 
     # arguments for iterative refinement generator
     group.add_argument('--iter-decode-eos-penalty', default=0.0, type=float, metavar='N',
-                       help='if > 0.0, it penalized early-stopping in decoding.')
+                       help='if > 0.0, it penalizes early-stopping in decoding.')
+    group.add_argument('--iter-decode-deletion-reward', default=0.0, type=float,
+                       help='it rewards deletion in decoding.')
     group.add_argument('--iter-decode-max-iter', default=10, type=int, metavar='N',
                        help='maximum iterations for iterative refinement.')
     group.add_argument('--iter-decode-force-max-iter', action='store_true',
@@ -562,6 +564,10 @@ def add_generation_args(parser):
                        help='if set, the last checkpoint are assumed to be a reranker to rescore the translations'),
     group.add_argument('--retain-iter-history', action='store_true',
                        help='if set, decoding returns the whole history of iterative refinement')
+    group.add_argument('--constrained-decoding', action='store_true',
+                       help='if set, run lexically constrained decoding')
+    group.add_argument('--hard-constrained-decoding', action='store_true',
+                       help='if set, treat all lexical constraints as hard constraints')
 
     # special decoding format for advanced decoding.
     group.add_argument('--decoding-format', default=None, type=str, choices=['unigram', 'ensemble', 'vote', 'dp', 'bs'])
@@ -576,6 +582,8 @@ def add_interactive_args(parser):
                        help='read this many sentences into a buffer before processing them')
     group.add_argument('--input', default='-', type=str, metavar='FILE',
                        help='file to read from; use - for stdin')
+    group.add_argument('--has-target', action='store_true',
+                       help='if set, read target sequences from input')
     # fmt: on
 
 

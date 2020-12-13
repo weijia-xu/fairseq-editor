@@ -77,6 +77,100 @@ class LabelSmoothedDualImitationCriterion(FairseqCriterion):
     def _custom_loss(self, loss, name="loss", factor=1.0):
         return {"name": name, "loss": loss, "factor": factor}
 
+    def _compute_soft_alignment_loss(
+        self, outputs, targets, masks=None, label_smoothing=0.0, name="saml-loss", factor=1.0
+    ):
+        """
+            outputs: batch x len x d_model
+            targets: batch x len
+            masks:   batch x len
+
+            policy_logprob: if there is some policy
+                depends on the likelihood score as rewards.
+        """
+
+        def mean_ds(x: Tensor, dim=None) -> Tensor:
+            return (
+                x.float().mean().type_as(x)
+                if dim is None
+                else x.float().mean(dim).type_as(x)
+            )
+
+        if masks is not None and not masks.any():
+            nll_loss = torch.tensor(0)
+            loss = nll_loss
+        else:
+            logits = F.log_softmax(outputs, dim=-1)
+            if masks is not None:
+                logits = logits.masked_fill(~masks.unsqueeze(2), -1e6)
+
+            seq_probs = F.softmax(logits, dim=1)
+            tok_probs = F.softmax(logits, dim=2)
+            probs = torch.sum(seq_probs * tok_probs, dim=1, keepdim=True)
+            aggr_logits = torch.log(probs.clamp(min=1e-6)).expand_as(logits)
+
+            if masks is not None:
+                aggr_logits, targets = aggr_logits[masks], targets[masks]
+
+            if targets.dim() == 1:
+                losses = F.nll_loss(aggr_logits, targets.to(aggr_logits.device), reduction='none')
+
+            else:  # soft-labels
+                losses = F.kl_div(aggr_logits, targets.to(aggr_logits.device), reduction='none')
+                losses = losses.sum(-1)
+
+            nll_loss = mean_ds(losses)
+            if label_smoothing > 0:
+                loss = nll_loss * (
+                    1 - label_smoothing) - mean_ds(aggr_logits) * label_smoothing
+            else:
+                loss = nll_loss
+
+        loss = loss * factor
+        return {"name": name, "loss": loss, "nll_loss": nll_loss, "factor": factor}
+
+    def _compute_BoN_loss(
+        self, outputs, targets, masks=None, name="BoN-loss", factor=1.0
+    ):
+        """
+            outputs: batch x len x d_model
+            targets: batch x len
+            masks:   batch x len
+
+            policy_logprob: if there is some policy
+                depends on the likelihood score as rewards.
+        """
+
+        def mean_ds(x: Tensor, dim=None) -> Tensor:
+            return (
+                x.float().mean().type_as(x)
+                if dim is None
+                else x.float().mean(dim).type_as(x)
+            )
+        if masks is not None and not masks.any():
+            nll_loss = torch.tensor(0)
+            loss = nll_loss
+        else:
+            max_len = targets.size(1)
+            probs = F.softmax(outputs, dim=-1)
+            targets = targets.to(probs.device)
+            target_indices = targets.unsqueeze(1).expand(-1, max_len, -1)
+            curr_probs = probs.gather(2, target_indices)
+            if masks is not None:
+                prob_masks = masks.unsqueeze(1) & masks.unsqueeze(2)
+                one_hot = torch.eye(max_len, device=probs.device).unsqueeze(0).expand(targets.size(0), -1, -1)
+                curr_probs.masked_scatter_(~prob_masks, one_hot)
+
+            next_probs = torch.cat((curr_probs[:, 1:, :], torch.zeros_like(curr_probs[:, 0:1, :])), dim=1)
+            next_probs = torch.cat((next_probs[:, :, 1:], torch.zeros_like(curr_probs[:, :, 0:1])), dim=2)
+            ngram_match = torch.sum(curr_probs * next_probs, dim=1).clamp(min=0, max=1)
+            losses = 1 - torch.sum(ngram_match, dim=1) / (max_len - 1)
+            nll_loss = mean_ds(losses)
+            loss = nll_loss
+
+        loss = loss * factor
+        return {"name": name, "loss": loss, "nll_loss": nll_loss, "factor": factor}
+
     def forward(self, model, sample, reduce=True):
         """Compute the loss for the given sample.
         Returns a tuple with three elements:
@@ -97,7 +191,24 @@ class LabelSmoothedDualImitationCriterion(FairseqCriterion):
         losses, nll_loss = [], []
 
         for obj in outputs:
-            if outputs[obj].get("loss", None) is None:
+            if outputs[obj].get("saml_loss", False) == True:
+                _losses = self._compute_soft_alignment_loss(
+                    outputs[obj].get("out"),
+                    outputs[obj].get("tgt"),
+                    outputs[obj].get("mask", None),
+                    outputs[obj].get("ls", 0.0),
+                    name=obj + '-loss',
+                    factor=outputs[obj].get("factor", 1.0)
+                )
+            elif outputs[obj].get("bon_loss", False) == True:
+                _losses = self._compute_BoN_loss(
+                    outputs[obj].get("out"),
+                    outputs[obj].get("tgt"),
+                    outputs[obj].get("mask", None),
+                    name=obj + '-loss',
+                    factor=outputs[obj].get("factor", 1.0)
+                )
+            elif outputs[obj].get("loss", None) is None:
                 _losses = self._compute_loss(
                     outputs[obj].get("out"),
                     outputs[obj].get("tgt"),

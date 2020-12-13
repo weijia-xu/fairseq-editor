@@ -100,7 +100,7 @@ def _get_del_targets(in_tokens, out_tokens, padding_idx):
         word_del_targets = libnat.generate_deletion_labels(
             in_tokens.int(),
             libnat.levenshtein_distance(
-                in_tokens.int(), out_tokens.int(),
+                in_tokens.int().contiguous(), out_tokens.int().contiguous(),
                 in_masks.sum(1).int(), out_masks.sum(1).int()
             )
         )
@@ -136,8 +136,121 @@ def _get_del_targets(in_tokens, out_tokens, padding_idx):
     return _get_del_targets_cpu(in_tokens, out_tokens, padding_idx)
 
 
+def _get_advanced_ins_targets(in_tokens, out_tokens, padding_idx, unk_idx):
+    libnat, use_cuda = load_libnat()
+
+    def _get_ins_targets_cuda(in_tokens, out_tokens, padding_idx, unk_idx):
+        in_masks = in_tokens.ne(padding_idx)
+        out_masks = out_tokens.ne(padding_idx)
+        mask_ins_targets, masked_tgt_masks = libnat.generate_insertion_labels(
+            out_tokens.int(),
+            libnat.advanced_levenshtein_distance(
+                in_tokens.int(), out_tokens.int(),
+                in_masks.sum(1).int(), out_masks.sum(1).int()
+            )
+        )
+        masked_tgt_masks = masked_tgt_masks.bool() & out_masks
+        mask_ins_targets = mask_ins_targets.type_as(
+            in_tokens)[:, 1:in_masks.size(1)].masked_fill_(~in_masks[:, 1:], 0)
+        masked_tgt_tokens = out_tokens.masked_fill(masked_tgt_masks, unk_idx)
+        return masked_tgt_masks, masked_tgt_tokens, mask_ins_targets
+
+    def _get_ins_targets_cpu(in_tokens, out_tokens, padding_idx, unk_idx):
+        in_seq_len, out_seq_len = in_tokens.size(1), out_tokens.size(1)
+
+        in_tokens_list = [
+            [t for t in s if t != padding_idx] for i, s in enumerate(in_tokens.tolist())
+        ]
+        out_tokens_list = [
+            [t for t in s if t != padding_idx]
+            for i, s in enumerate(out_tokens.tolist())
+        ]
+
+        full_labels = libnat.suggested_ed3_path(
+            in_tokens_list, out_tokens_list, padding_idx
+        )
+        mask_inputs = [
+            [len(c) if c[0] != padding_idx else 0 for c in a[:-1]] for a in full_labels
+        ]
+        word_del_targets = [b[-1] for b in full_labels]
+
+        # generate labels
+        masked_tgt_masks = []
+        for mask_input, del_labels in zip(mask_inputs, word_del_targets):
+            mask_label = []
+            for beam_size, del_label in zip(mask_input[1:-1], del_labels):  # HACK 1:-1
+                if del_label > 0:
+                    mask_label += [0]
+                mask_label += [1 for _ in range(beam_size)]
+            masked_tgt_masks.append(
+                mask_label + [0 for _ in range(out_seq_len - len(mask_label))]
+            )
+        mask_ins_targets = [
+            mask_input[1:-1] + [0 for _ in range(in_seq_len - 1 - len(mask_input[1:-1]))]
+            for mask_input in mask_inputs
+        ]
+
+        # transform to tensor
+        masked_tgt_masks = torch.tensor(
+            masked_tgt_masks, device=out_tokens.device
+        ).bool()
+        mask_ins_targets = torch.tensor(mask_ins_targets, device=in_tokens.device)
+        masked_tgt_tokens = out_tokens.masked_fill(masked_tgt_masks, unk_idx)
+        return masked_tgt_masks, masked_tgt_tokens, mask_ins_targets
+
+    if use_cuda:
+        return _get_ins_targets_cuda(in_tokens, out_tokens, padding_idx, unk_idx)
+    return _get_ins_targets_cpu(in_tokens, out_tokens, padding_idx, unk_idx)
+
+
+def _get_advanced_reposition_targets(in_tokens, out_tokens, padding_idx):
+    libnat, use_cuda = load_libnat()
+
+    def _get_reposition_targets_cuda(in_tokens, out_tokens, padding_idx):
+        in_masks = in_tokens.ne(padding_idx)
+        out_masks = out_tokens.ne(padding_idx)
+
+        word_reposition_targets = libnat.generate_reposition_labels(
+            in_tokens.int(),
+            libnat.advanced_levenshtein_distance(
+                in_tokens.int(), out_tokens.int(),
+                in_masks.sum(1).int(), out_masks.sum(1).int()
+            )
+        )
+        word_reposition_targets = word_reposition_targets.type_as(in_tokens).masked_fill_(~in_masks, 0)
+        return word_reposition_targets
+
+    def _get_reposition_targets_cpu(in_tokens, out_tokens, padding_idx):
+        out_seq_len = out_tokens.size(1)
+        with torch.cuda.device_of(in_tokens):
+            in_tokens_list = [
+                [t for t in s if t != padding_idx] for i, s in enumerate(in_tokens.tolist())
+            ]
+            out_tokens_list = [
+                [t for t in s if t != padding_idx]
+                for i, s in enumerate(out_tokens.tolist())
+            ]
+
+        full_labels = libnat.suggested_ed3_path(
+            in_tokens_list, out_tokens_list, padding_idx
+        )
+        word_reposition_targets = [b[-1] for b in full_labels]
+        word_reposition_targets = [
+            labels + [0 for _ in range(out_seq_len - len(labels))]
+            for labels in word_reposition_targets
+        ]
+
+        # transform to tensor
+        word_reposition_targets = torch.tensor(word_reposition_targets, device=out_tokens.device)
+        return word_reposition_targets
+
+    if use_cuda:
+        return _get_reposition_targets_cuda(in_tokens, out_tokens, padding_idx)
+    return _get_reposition_targets_cpu(in_tokens, out_tokens, padding_idx)
+
+
 def _apply_ins_masks(
-    in_tokens, in_scores, mask_ins_pred, padding_idx, unk_idx, eos_idx
+    in_tokens, in_marks, in_scores, mask_ins_pred, padding_idx, unk_idx, eos_idx
 ):
 
     in_masks = in_tokens.ne(padding_idx)
@@ -154,23 +267,30 @@ def _apply_ins_masks(
         < out_lengths[:, None]
     )
 
-    reordering = (mask_ins_pred + in_masks[:, 1:].long()).cumsum(1)
+    reposition = (mask_ins_pred + in_masks[:, 1:].long()).cumsum(1)
     out_tokens = (
         in_tokens.new_zeros(in_tokens.size(0), out_max_len)
         .fill_(padding_idx)
         .masked_fill_(out_masks, unk_idx)
     )
     out_tokens[:, 0] = in_tokens[:, 0]
-    out_tokens.scatter_(1, reordering, in_tokens[:, 1:])
+    out_tokens.scatter_(1, reposition, in_tokens[:, 1:])
+
+    out_marks = None
+    if in_marks is not None:
+        in_marks.masked_fill_(~in_masks, 0)
+        out_marks = in_marks.new_zeros(*out_tokens.size())
+        out_marks[:, 0] = in_marks[:, 0]
+        out_marks.scatter_(1, reposition, in_marks[:, 1:])
 
     out_scores = None
     if in_scores is not None:
         in_scores.masked_fill_(~in_masks, 0)
         out_scores = in_scores.new_zeros(*out_tokens.size())
         out_scores[:, 0] = in_scores[:, 0]
-        out_scores.scatter_(1, reordering, in_scores[:, 1:])
+        out_scores.scatter_(1, reposition, in_scores[:, 1:])
 
-    return out_tokens, out_scores
+    return out_tokens, out_marks, out_scores
 
 
 def _apply_ins_words(
@@ -190,7 +310,7 @@ def _apply_ins_words(
 
 
 def _apply_del_words(
-    in_tokens, in_scores, in_attn, word_del_pred, padding_idx, bos_idx, eos_idx
+    in_tokens, in_marks, in_scores, in_attn, word_del_pred, padding_idx, bos_idx, eos_idx
 ):
     # apply deletion to a tensor
     in_masks = in_tokens.ne(padding_idx)
@@ -200,25 +320,70 @@ def _apply_del_words(
     word_del_pred.masked_fill_(~in_masks, 1)
     word_del_pred.masked_fill_(bos_eos_masks, 0)
 
-    reordering = (
+    reposition = (
         new_arange(in_tokens)
         .masked_fill_(word_del_pred, max_len)
         .sort(1)[1]
     )
 
-    out_tokens = in_tokens.masked_fill(word_del_pred, padding_idx).gather(1, reordering)
+    out_tokens = in_tokens.masked_fill(word_del_pred, padding_idx).gather(1, reposition)
+
+    out_marks = None
+    if in_marks is not None:
+        out_marks = in_marks.masked_fill(word_del_pred, 0).gather(1, reposition)
 
     out_scores = None
     if in_scores is not None:
-        out_scores = in_scores.masked_fill(word_del_pred, 0).gather(1, reordering)
+        out_scores = in_scores.masked_fill(word_del_pred, 0).gather(1, reposition)
 
     out_attn = None
     if in_attn is not None:
         _mask = word_del_pred[:, :, None].expand_as(in_attn)
-        _reordering = reordering[:, :, None].expand_as(in_attn)
-        out_attn = in_attn.masked_fill(_mask, 0.).gather(1, _reordering)
+        _reposition = reposition[:, :, None].expand_as(in_attn)
+        out_attn = in_attn.masked_fill(_mask, 0.).gather(1, _reposition)
 
-    return out_tokens, out_scores, out_attn
+    return out_tokens, out_marks, out_scores, out_attn
+
+
+def _apply_reposition_words(
+    in_tokens, in_marks, in_scores, in_attn, word_reposition_pred, padding_idx, bos_idx, eos_idx
+):
+    # apply reposition
+    in_masks = in_tokens.ne(padding_idx)
+    word_reposition_pred.masked_fill_(~in_masks, 0)
+    word_reposition_pred = word_reposition_pred.clamp(min=0, max=in_tokens.size(1) - 1)
+    out_tokens = (in_tokens
+        .gather(1, word_reposition_pred)
+        .masked_fill(word_reposition_pred.eq(0), padding_idx)
+        .masked_fill(in_tokens.eq(bos_idx), bos_idx)
+        .masked_fill(in_tokens.eq(eos_idx), eos_idx)
+    )
+
+    out_marks = None
+    if in_marks is not None:
+        out_marks = in_marks.gather(1, word_reposition_pred)
+
+    out_scores = None
+    if in_scores is not None:
+        out_scores = in_scores.gather(1, word_reposition_pred)
+
+    out_attn = None
+    if in_attn is not None:
+        _reposition = word_reposition_pred[:, :, None].expand_as(in_attn)
+        out_attn = in_attn.gather(1, _reposition)
+
+    # apply deletion
+    out_tokens, out_marks, out_scores, out_attn = _apply_del_words(
+        out_tokens,
+        out_marks,
+        out_scores,
+        out_attn,
+        out_tokens.eq(padding_idx),
+        padding_idx,
+        bos_idx,
+        eos_idx
+    )
+    return out_tokens, out_marks, out_scores, out_attn
 
 
 def _skip(x, mask):

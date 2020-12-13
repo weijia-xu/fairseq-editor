@@ -19,6 +19,7 @@ from fairseq.data import (
     encoders,
     indexed_dataset,
     LanguagePairDataset,
+    MultiSourceTranslationDataset,
     PrependTokenDataset,
     StripTokenDataset,
     TruncateDataset,
@@ -257,8 +258,11 @@ class TranslationTask(FairseqTask):
             truncate_source=self.args.truncate_source,
         )
 
-    def build_dataset_for_inference(self, src_tokens, src_lengths):
-        return LanguagePairDataset(src_tokens, src_lengths, self.source_dictionary)
+    def build_dataset_for_inference(self, src_tokens, src_lengths, tgt_tokens=None, tgt_lengths=None, num_source_inputs=1):
+        if num_source_inputs == 1:
+            return LanguagePairDataset(src_tokens, src_lengths, self.source_dictionary, tgt=tgt_tokens, tgt_sizes=tgt_lengths)
+        else:
+            return MultiSourceTranslationDataset(src_tokens, src_lengths, self.source_dictionary, tgt=tgt_tokens, tgt_sizes=tgt_lengths)
 
     def build_model(self, args):
         if getattr(args, 'eval_bleu', False):
@@ -367,5 +371,7 @@ class TranslationTask(FairseqTask):
         if self.args.eval_bleu_print_samples:
             logger.info('example hypothesis: ' + hyps[0])
             logger.info('example reference: ' + refs[0])
-        tokenize = sacrebleu.DEFAULT_TOKENIZER if not self.args.eval_tokenized_bleu else 'none'
-        return sacrebleu.corpus_bleu(hyps, [refs], tokenize=tokenize)
+        if self.args.eval_tokenized_bleu:
+            return sacrebleu.corpus_bleu(hyps, [refs], tokenize='none')
+        else:
+            return sacrebleu.corpus_bleu(hyps, [refs])

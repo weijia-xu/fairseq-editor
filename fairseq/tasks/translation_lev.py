@@ -7,6 +7,7 @@ import os
 
 import torch
 
+from fairseq.data import noising
 from fairseq.utils import new_arange
 from fairseq.tasks import register_task
 from fairseq.tasks.translation import TranslationTask, load_langpair_dataset
@@ -27,7 +28,8 @@ class TranslationLevenshteinTask(TranslationTask):
         parser.add_argument(
             '--noise',
             default='random_delete',
-            choices=['random_delete', 'random_mask', 'no_noise', 'full_mask'])
+            choices=['random_delete', 'random_delete_shuffle', 'random_mask', 'no_noise', 'full_mask'])
+        parser.add_argument('--random-seed', default=1, type=int)
 
     def load_dataset(self, split, epoch=1, combine=False, **kwargs):
         """Load a given dataset split.
@@ -79,9 +81,20 @@ class TranslationLevenshteinTask(TranslationTask):
                     1,
                     target_rank.masked_fill_(target_cutoff,
                                              max_len).sort(1)[1])
-            prev_target_tokens = prev_target_tokens[:, :prev_target_tokens.
-                                                    ne(pad).sum(1).max()]
+            prev_target_tokens = prev_target_tokens[:, :prev_target_tokens.ne(pad).sum(1).max()]
 
+            return prev_target_tokens
+
+        def _random_shuffle(target_tokens, p, max_shuffle_distance):
+            word_shuffle = noising.WordShuffle(self.tgt_dict)
+            target_mask = target_tokens.eq(self.tgt_dict.pad())
+            target_length = target_mask.size(1) - target_mask.long().sum(1)
+            prev_target_tokens, _ = word_shuffle.noising(
+                target_tokens.t().cpu(), target_length.cpu(), max_shuffle_distance)
+            prev_target_tokens = prev_target_tokens.to(target_tokens.device).t()
+            masks = (target_tokens.clone().sum(dim=1, keepdim=True).float()
+                .uniform_(0, 1) < p)
+            prev_target_tokens = masks * prev_target_tokens + (~masks) * target_tokens
             return prev_target_tokens
 
         def _random_mask(target_tokens):
@@ -115,7 +128,9 @@ class TranslationLevenshteinTask(TranslationTask):
                 eos) | target_tokens.eq(pad)
             return target_tokens.masked_fill(~target_mask, unk)
 
-        if self.args.noise == 'random_delete':
+        if self.args.noise == 'random_delete_shuffle':
+            return _random_shuffle(_random_delete(target_tokens), 0.5, 3)
+        elif self.args.noise == 'random_delete':
             return _random_delete(target_tokens)
         elif self.args.noise == 'random_mask':
             return _random_mask(target_tokens)
@@ -131,12 +146,16 @@ class TranslationLevenshteinTask(TranslationTask):
         return IterativeRefinementGenerator(
             self.target_dictionary,
             eos_penalty=getattr(args, 'iter_decode_eos_penalty', 0.0),
+            del_reward=getattr(args, 'iter_decode_deletion_reward', 0.0),
             max_iter=getattr(args, 'iter_decode_max_iter', 10),
             beam_size=getattr(args, 'iter_decode_with_beam', 1),
             reranking=getattr(args, 'iter_decode_with_external_reranker', False),
             decoding_format=getattr(args, 'decoding_format', None),
             adaptive=not getattr(args, 'iter_decode_force_max_iter', False),
-            retain_history=getattr(args, 'retain_iter_history', False))
+            retain_history=getattr(args, 'retain_iter_history', False),
+            constrained_decoding=getattr(args, 'constrained_decoding', False),
+            hard_constrained_decoding=getattr(args, 'hard_constrained_decoding', False),
+            random_seed=getattr(args, 'random_seed', 1))
 
     def train_step(self,
                    sample,
