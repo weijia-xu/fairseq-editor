@@ -358,6 +358,8 @@ def _upgrade_state_dict(state):
             state["extra_state"]["train_iterator"].get("epoch", 1),
             1,
         )
+    if state["args"].arch == "reposition_levenshtein_transformer":
+        state["args"].arch = "editor_transformer"
 
     # set any missing default values in the task, model or other registries
     registry.set_defaults(state["args"], tasks.TASK_REGISTRY[state["args"].task])

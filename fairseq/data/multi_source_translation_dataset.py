@@ -204,23 +204,18 @@ class MultiSourceTranslationDataset(FairseqDataset):
             if self.tgt and self.tgt[index][-1] != eos:
                 tgt_item = torch.cat([self.tgt[index], torch.LongTensor([eos])])
 
-        if self.append_bos:
-            bos = self.tgt_dict.bos() if self.tgt_dict else self.src_dict.bos()
-            if self.tgt and self.tgt[index][0] != bos:
-                tgt_item = torch.cat([torch.LongTensor([bos]), self.tgt[index]])
-
         src_items = []
-        for src in self.src:
+        for i, src in enumerate(self.src):
             src_item = src[index]
-            if self.append_bos:
+            if self.append_bos and i == 0:
                 bos = self.src_dict.bos()
-                if src[index][-1] != bos:
-                    src_item = torch.cat([torch.LongTensor([bos]), src[index]])
+                if src_item[0] != bos:
+                    src_item = torch.cat([torch.LongTensor([bos]), src_item])
 
-            if self.remove_eos_from_source:
+            if self.remove_eos_from_source and i == 0:
                 eos = self.src_dict.eos()
-                if src[index][-1] == eos:
-                    src_item = src[index][:-1]
+                if src_item[-1] == eos:
+                    src_item = src_item[:-1]
             src_items.append(src_item)
 
         example = {

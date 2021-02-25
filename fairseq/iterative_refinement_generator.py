@@ -225,9 +225,12 @@ class IterativeRefinementGenerator(object):
                 max_step=self.max_iter + 1,
             )
 
-            decoder_out = model.forward_decoder(
-                prev_decoder_out, encoder_out, self.hard_constrained_decoding, **decoder_options
-            )
+            if self.hard_constrained_decoding:
+                decoder_out = model.forward_decoder(
+                    prev_decoder_out, encoder_out, hard_constrained_decoding=True, **decoder_options)
+            else:
+                decoder_out = model.forward_decoder(
+                    prev_decoder_out, encoder_out, **decoder_options)
 
             if self.adaptive:
                 # terminate if there is a loop

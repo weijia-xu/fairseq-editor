@@ -7,7 +7,7 @@ import os
 
 import torch
 
-from fairseq.data import noising
+from fairseq.data import LanguagePairDataset, MultiSourceTranslationDataset, noising
 from fairseq.utils import new_arange
 from fairseq.tasks import register_task
 from fairseq.tasks.translation import TranslationTask, load_langpair_dataset
@@ -156,6 +156,12 @@ class TranslationLevenshteinTask(TranslationTask):
             constrained_decoding=getattr(args, 'constrained_decoding', False),
             hard_constrained_decoding=getattr(args, 'hard_constrained_decoding', False),
             random_seed=getattr(args, 'random_seed', 1))
+
+    def build_dataset_for_inference(self, src_tokens, src_lengths, tgt_tokens=None, tgt_lengths=None, num_source_inputs=1):
+        if num_source_inputs == 1:
+            return LanguagePairDataset(src_tokens, src_lengths, self.source_dictionary, tgt=tgt_tokens, tgt_sizes=tgt_lengths, append_bos=True)
+        else:
+            return MultiSourceTranslationDataset(src_tokens, src_lengths, self.source_dictionary, tgt=tgt_tokens, tgt_sizes=tgt_lengths, append_bos=True)
 
     def train_step(self,
                    sample,
