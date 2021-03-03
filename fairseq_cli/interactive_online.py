@@ -199,7 +199,8 @@ def main(args):
     logger.info('NOTE: hypothesis and token scores are output in base 2')
     logger.info('Type the input sentence and press return:')
     start_id = 0
-    for inputs in buffered_read(args.input, buffer_size=1):
+    for line in sys.stdin:
+        inputs = [line.strip()]
         results = []
         for batch in make_batches(inputs, args, task, max_positions, encode_fn):
             src_tokens = batch.src_tokens
