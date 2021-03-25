@@ -143,9 +143,9 @@ def _get_advanced_ins_targets(in_tokens, out_tokens, padding_idx, unk_idx):
         in_masks = in_tokens.ne(padding_idx)
         out_masks = out_tokens.ne(padding_idx)
         mask_ins_targets, masked_tgt_masks = libnat.generate_insertion_labels(
-            out_tokens.int(),
+            out_tokens.int().contiguous(),
             libnat.advanced_levenshtein_distance(
-                in_tokens.int(), out_tokens.int(),
+                in_tokens.int().contiguous(), out_tokens.int().contiguous(),
                 in_masks.sum(1).int(), out_masks.sum(1).int()
             )
         )
@@ -211,9 +211,9 @@ def _get_advanced_reposition_targets(in_tokens, out_tokens, padding_idx):
         out_masks = out_tokens.ne(padding_idx)
 
         word_reposition_targets = libnat.generate_reposition_labels(
-            in_tokens.int(),
+            in_tokens.int().contiguous(),
             libnat.advanced_levenshtein_distance(
-                in_tokens.int(), out_tokens.int(),
+                in_tokens.int().contiguous(), out_tokens.int().contiguous(),
                 in_masks.sum(1).int(), out_masks.sum(1).int()
             )
         )
