@@ -221,7 +221,7 @@ def _get_advanced_reposition_targets(in_tokens, out_tokens, padding_idx):
         return word_reposition_targets
 
     def _get_reposition_targets_cpu(in_tokens, out_tokens, padding_idx):
-        out_seq_len = out_tokens.size(1)
+        out_seq_len = in_tokens.size(1)
         with torch.cuda.device_of(in_tokens):
             in_tokens_list = [
                 [t for t in s if t != padding_idx] for i, s in enumerate(in_tokens.tolist())
@@ -241,7 +241,7 @@ def _get_advanced_reposition_targets(in_tokens, out_tokens, padding_idx):
         ]
 
         # transform to tensor
-        word_reposition_targets = torch.tensor(word_reposition_targets, device=out_tokens.device)
+        word_reposition_targets = torch.tensor(word_reposition_targets, device=in_tokens.device)
         return word_reposition_targets
 
     if use_cuda:
